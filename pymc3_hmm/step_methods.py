@@ -6,9 +6,12 @@ import pymc3 as pm
 
 from itertools import chain
 
+from theano.tensor.subtensor import AdvancedIncSubtensor1
+from theano.tensor.var import TensorConstant
 from theano.gof.op import get_test_value as test_value
 
 from pymc3.step_methods.arraystep import ArrayStep, Competence
+from pymc3.util import get_untransformed_name
 
 from pymc3_hmm.distributions import DiscreteMarkovChain
 from pymc3_hmm.utils import compute_trans_freqs
@@ -202,14 +205,14 @@ class TransMatConjugateStep(ArrayStep):
 
     name = "trans-mat-conjugate"
 
-    def __init__(self, dir_priors, hmm_states, values=None, model=None, rng=None):
+    def __init__(self, dir_priors, state_seq, values=None, model=None, rng=None):
         """Initialize a `TransMatConjugateStep` object.
 
         Parameters
         ----------
         dir_priors : list of Dirichlets
             State-ordered from-to prior transition probabilities.
-        hmm_states : DiscreteMarkovChain
+        state_seq : DiscreteMarkovChain
             The HMM state sequence that uses `dir_priors` as its transition matrix.
         """
 
@@ -217,21 +220,94 @@ class TransMatConjugateStep(ArrayStep):
 
         dir_priors = list(chain.from_iterable([pm.inputvars(d) for d in dir_priors]))
 
+        if state_seq in model.observed_RVs:
+            self.state_seq_obs = np.asarray(state_seq.distribution.data)
+
+        # TODO: Are the rows in this matrix our `dir_priors`?
+        self.Gammas = state_seq.distribution.Gammas
+        self.dir_priors_untrans = {
+            d: model.named_vars[get_untransformed_name(d.name)] for d in dir_priors
+        }
+
+        # TODO: Canonicalize the transition matrix
+
+        if isinstance(self.Gammas, pm.model.DeterministicWrapper):
+            # It's a `Deterministic`
+            Gamma_DimShuffle = self.Gammas.owner.inputs[0].owner
+        else:
+            Gamma_DimShuffle = self.Gammas.owner
+
+        if not (
+            isinstance(Gamma_DimShuffle.op, tt.elemwise.DimShuffle)
+            and Gamma_DimShuffle.op._props()[1] == ("x", 0, 1)
+        ):
+            raise TypeError("The transition matrix should be non-time-varying")
+
+        Gamma_Join = Gamma_DimShuffle.inputs[0].owner
+
+        if not (
+            isinstance(Gamma_Join.op, tt.basic.Join)
+            and tt.get_scalar_constant_value(Gamma_Join.inputs[0]) == 0
+        ):
+            raise TypeError(
+                "The transition matrix should be comprised of stacked row vectors"
+            )
+
+        Gamma_rows = Gamma_Join.inputs[1:]
+
+        self.n_rows = len(Gamma_rows)
+
+        # Loop through the rows in the transition matrix's graph and determine
+        # how our transformed Dirichlet RVs map to this transition matrix.
+        self.row_remaps = {}
+        self.row_slices = {}
+        for i, dim_row in enumerate(Gamma_rows):
+            # By-pass the mandatory `DimShuffle`
+            gamma_row = dim_row.owner.inputs[0]
+            for j, dirich in enumerate(dir_priors):
+                untrans_dirich = self.dir_priors_untrans[dirich]
+                if gamma_row == untrans_dirich:
+                    # A row that's simply a `Dirichlet`
+                    self.row_remaps[j] = i
+                    self.row_slices[j] = slice(None)
+                elif (
+                    gamma_row.owner
+                    and isinstance(gamma_row.owner.op, AdvancedIncSubtensor1)
+                    and gamma_row.owner.inputs[1] == untrans_dirich
+                ):
+                    # Parts of a row set by a `*Subtensor*` `Op` using a full
+                    # `Dirichlet` e.g. `P_row[idx] = dir_rv`
+                    self.row_remaps[j] = i
+
+                    rhand_val = gamma_row.owner.inputs[2]
+                    if not isinstance(rhand_val, TensorConstant):
+                        # TODO: We could allow more types of `idx` (e.g. slices)
+                        # Currently, `idx` can't be something like `2:5`
+                        raise TypeError(
+                            "Only array indexing allowed for mixed Dirichlet/non-Dirichlet rows"
+                        )
+                    self.row_slices[j] = rhand_val.data
+
         self.rng = rng
         self.dists = list(dir_priors)
-        self.hmm_states = hmm_states.name
-        # TODO: Perform a consistency check between `hmm_states.Gamma` and
-        # `dir_priors`.
+        self.state_seq_name = state_seq.name
 
         super().__init__(dir_priors, [], allvars=True)
 
     def astep(self, point, inputs):
-        states = inputs[self.hmm_states]
-        N_mat = compute_trans_freqs(states, len(self.dists), counts_only=True)
+
+        states = getattr(self, "state_seq_obs", None)
+        if states is None:
+            states = inputs[self.state_seq_name]
+
+        N_mat = compute_trans_freqs(states, self.n_rows, counts_only=True)
 
         trans_res = [
             d.distribution.dist.transform.forward_val(
-                np.random.dirichlet(test_value(d.distribution.dist.a) + N_mat[i])
+                np.random.dirichlet(
+                    test_value(d.distribution.dist.a)
+                    + N_mat[self.row_remaps[i]][self.row_slices[i]]
+                )
             )
             for i, d in enumerate(self.dists)
         ]
